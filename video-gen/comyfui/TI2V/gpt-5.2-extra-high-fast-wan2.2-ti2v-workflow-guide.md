@@ -276,6 +276,216 @@ How it differs from “older/alternative ComfyUI video workflows”:
 - Compared to “image model + motion module” graphs (AnimateDiff-style), WAN is closer to an **end-to-end video model** (fewer moving parts, often stronger temporal coherence, less modular).
 - Compared to workflows with ControlNet/IP-Adapter, this template is **simpler** but offers fewer explicit controls.
 
+
+#### WAN 2.2 system + model architecture (repo-level view)
+
+This workflow is a **ComfyUI surface** over the underlying WAN 2.2 system, which (at a high level) is a diffusion-based video generator with shared text/VAE components and multiple task-specialized backbones.
+
+Primary architecture reference: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2)
+
+##### High-level design goals
+
+From the WAN 2.2 project description, the core goals are:
+
+- **High-quality, controllable video synthesis** across multiple tasks (T2V, I2V, TI2V, S2V, Animate).
+- **Scalable deployment**: from a single consumer GPU (notably TI2V-5B) to multi-GPU distributed inference (FSDP + sequence parallelism).
+- **Unified components**: shared text encoder and VAE across variants, with task-specialized diffusion backbones.
+
+(See [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+##### Model variants (where TI2V-5B fits)
+
+WAN 2.2 is described as a family of checkpoints optimized for different tasks and hardware targets:
+
+| Variant | Primary task | Architecture | Notes |
+| --- | --- | --- | --- |
+| **T2V-A14B** | Text → Video | **MoE** (2 experts; 27B total / 14B active) | Enterprise / multi-GPU focus |
+| **I2V-A14B** | Image → Video | **MoE** (2 experts; 27B total / 14B active) | Enterprise / multi-GPU focus |
+| **TI2V-5B** | Text+Image → Video | **Dense** 5B transformer | Consumer-GPU oriented (24GB class) |
+| **S2V-14B** | Speech → Video | Dense + audio encoder | Lip-sync focus |
+| **Animate-14B** | Animation/replacement | Dense + face/CLIP components | Character workflows |
+
+(Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+**Important implication for this ComfyUI template:** the `wan2.2_ti2v_5B_fp16.safetensors` checkpoint in this workflow corresponds to the **dense TI2V-5B** variant (not the MoE A14B variants). That’s why the graph stays simple: you don’t need MoE routing logic exposed at the workflow level.
+
+##### End-to-end pipeline (how text + image are processed)
+
+Below is a “systems view” of what the WAN 2.2 TI2V pipeline is doing conceptually. This matches the ComfyUI graph, but uses model-module names.
+
+```
+Text prompt(s)
+  │
+  ├─► Text encoder (T5/UMT5 XXL) ──► text embeddings / conditioning
+  │
+Start image
+  │
+  └─► VAE encoder (AutoencoderKLWan2) ──► image latent
+
+Latent init (TI2V)
+  └─► build spatio-temporal latent (resolution + length)
+
+Diffusion sampling loop
+  for t in timesteps:
+    ├─► (optional) CFG combine: positive vs negative conditioning
+    ├─► Wan diffusion backbone (dense DiT-style transformer for TI2V-5B)
+    └─► update latent using scheduler/solver
+
+VAE decode
+  └─► latent frames → RGB frames
+
+Video writer
+  └─► RGB frames + fps → video file
+```
+
+Shared components are described as:
+
+- **Text encoder**: `T5EncoderModel` using `google/umt5-xxl` (WAN uses a UMT5/T5-family text encoder). In ComfyUI WAN templates this is surfaced via `CLIPLoader`/`CLIPTextEncode`, but functionally it’s a T5-style encoder.
+- **VAE**: `AutoencoderKLWan2` (WAN-specific VAE), surfaced as `VAELoader` + `VAEDecode`.
+
+(See [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+##### High-compression VAE (why TI2V-5B is practical on 24GB GPUs)
+
+A key TI2V-5B design point is **very aggressive latent compression** to reduce the spatio-temporal token count during diffusion.
+
+DeepWiki summarizes the compression as:
+
+- **Temporal compression**: **4×**
+- **Spatial compression**:
+  - “Standard” WAN VAE: **16×16** spatial compression (combined with 4× temporal = 1024× overall)
+  - **TI2V-5B**: **32×32** spatial compression (combined with 4× temporal = 4096× overall)
+- Plus an **additional 2×2 patchification** (effectively increasing efficiency for TI2V-5B)
+
+(Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+A helpful mental model for shape changes:
+
+```
+Pixel video:        [T, H, W, 3]
+VAE latent (TI2V):  [T/4, H/32, W/32, C]
+(tokens/patches):  sequence length shrinks further (implementation-specific)
+Diffusion runs primarily over this compressed representation.
+```
+
+This is the *architectural* reason you can target “720P @ 24fps” workloads with TI2V-5B on consumer GPUs, while larger variants (A14B MoE) typically require multi-GPU.
+
+##### MoE routing (only for T2V-A14B and I2V-A14B)
+
+WAN 2.2’s Mixture-of-Experts design applies to the **A14B** T2V and I2V models:
+
+- Two experts total (~13.5B each), **27B parameters** total
+- **14B active per timestep** (constant inference cost)
+- Routing is based on **SNR**: a “high-noise” expert is used earlier in denoising, and a “low-noise” expert later for refinement
+- The switch threshold is described via `t_moe` (linked to an SNR threshold)
+
+(Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+ASCII intuition:
+
+```
+noise high (early timesteps)  ──► Expert A (structure / motion planning)
+noise low  (late timesteps)   ──► Expert B (detail / refinement)
+```
+
+Again: **TI2V-5B is dense**, so you typically won’t think about `t_moe` when working with this specific ComfyUI workflow.
+
+##### Mapping: ComfyUI nodes ↔ WAN 2.2 components
+
+This mapping helps you reason about “what to change” in ComfyUI in terms of the underlying architecture:
+
+| ComfyUI node | What it corresponds to | Primary output |
+| --- | --- | --- |
+| `UNETLoader` | WAN diffusion backbone weights (TI2V-5B) | `MODEL` |
+| `ModelSamplingSD3` | Model-specific sampling configuration (sigma/noise conventions) | `MODEL` |
+| `CLIPLoader` | WAN’s UMT5/T5 text encoder weights | `CLIP` |
+| `CLIPTextEncode` | Prompt tokenization + text embedding | `CONDITIONING` |
+| `VAELoader` | WAN VAE (`AutoencoderKLWan2`) | `VAE` |
+| `Wan22ImageToVideoLatent` | VAE encode + latent initialization for TI2V | `LATENT` |
+| `KSampler` | Diffusion denoising loop + CFG + scheduler/solver | `LATENT` |
+| `VAEDecode` | VAE decode latent → frames | `IMAGE` |
+| `CreateVideo` | Frame sequence → video container | `VIDEO` |
+| `SaveVideo` | Encode/write video | file |
+
+##### Key insights for modification (architecture-first)
+
+- **Quality vs. speed is dominated by token count**: resolution × frames × (how much the VAE compresses). For TI2V-5B, the high-compression VAE is the enabler; your safest knobs are still **resolution, frames, steps**.
+- **Text conditioning is shared across variants**: improvements in prompting generally transfer across tasks because WAN uses a large T5-family encoder.
+- **If you need “more control”** (pose, depth, edges, identity locks), you’re not changing the WAN backbone—you’re adding **extra conditioning paths** in ComfyUI (LoRA/adapters/Control-like modules) and merging conditioning.
+- **If you need “more raw quality”** beyond what TI2V-5B can deliver, you’re in “model variant selection” territory (MoE A14B models, multi-GPU inference), not just workflow tweaks.
+
+
+
+##### Internal mechanics: diffusion backbone (dense DiT vs. MoE)
+
+DeepWiki describes WAN’s diffusion backbone as a **DiT-style transformer** (Diffusion Transformer). Conceptually, it behaves like a denoiser function:
+
+- **Inputs**:
+  - A **noisy latent video** (in TI2V-5B, heavily VAE-compressed)
+  - A **timestep / noise level** (what stage of denoising we’re at)
+  - **Text conditioning embeddings** (from UMT5/T5)
+- **Output**:
+  - A **denoising direction** (often described as “predicted noise / residual”), which the sampler uses to update the latent
+
+A useful mental diagram:
+
+```
+noisy latent tokens + time embedding
+            │
+            ▼
+   transformer blocks (spatio-temporal attention)
+            │
+            ├─► cross-attend to text embeddings (conditioning)
+            │
+            ▼
+   predicted denoising residual ("noise estimate")
+            │
+            ▼
+   scheduler/solver step → next latent
+```
+
+Where this shows up in ComfyUI:
+
+- `KSampler` is the **outer denoising loop** (scheduler + solver + CFG)
+- `UNETLoader` provides the **denoiser weights** (called “UNet” in ComfyUI, but WAN is transformer-style internally)
+- `ModelSamplingSD3` ensures the **model-specific sampling conventions** are applied correctly
+
+(Architecture source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+##### Code structure (Wan2.2 repo) — where to modify what
+
+If you’re modifying WAN 2.2 itself (not just the ComfyUI workflow), DeepWiki summarizes a code-level layout like:
+
+- **Entry point**: `generate.py` parses CLI args and routes to the correct pipeline
+- **Pipeline classes**:
+  - `WanT2V`, `WanI2V`, `WanTI2V` (image/video generation pipelines)
+  - `WanS2V` (speech-driven)
+  - `WanAnimate` (animation/replacement)
+- **Backbone**: `WanModel` implements the diffusion transformer (and MoE routing for the A14B variants)
+- **Config**: `WAN_CONFIGS`, `SIZE_CONFIGS`, `MAX_AREA_CONFIGS` manage resolution/limits
+- **Distributed inference**:
+  - FSDP sharding utilities (`shard_model()`, `free_model()`) in `fsdp.py`
+  - sequence parallel / distributed init (`init_distributed_group()`)
+
+(Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+##### System-level variables / parameters (repo / CLI) and what they control
+
+These aren’t exposed directly in this ComfyUI template, but they explain **why some variants require multi-GPU** and how inference is scaled/optimized.
+
+| Variable / flag | What it controls | Why it exists | How changing it affects behavior |
+| --- | --- | --- | --- |
+| `--task` (e.g. `ti2v-5B`) | Which WAN variant pipeline/checkpoint to run | Different tasks need different backbones | Changes capability + compute profile |
+| `--offload_model` | Offload inactive model parts to CPU | Fit bigger models in limited VRAM | Slower, but can prevent OOM |
+| `--convert_model_dtype` | Weight precision (FP16/BF16, etc.) | Reduce VRAM, speed up | Too aggressive can reduce quality/stability |
+| `--t5_cpu` | Run T5 encoder on CPU | Save VRAM (text encoder is large) | Slower prompt encoding; frees VRAM |
+| `--dit_fsdp`, `--t5_fsdp` | FSDP shard DiT / T5 across GPUs | Run models larger than a single GPU | Enables A14B MoE variants |
+| `--ulysses_size N` | Sequence-parallel size | Parallelize attention/sequence compute | Enables higher resolution/longer sequences |
+| `t_moe` (config) | MoE expert switching threshold (A14B only) | Use different experts for early vs late denoising | Can trade structure vs refinement behavior |
+
+(Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
+
+
 ---
 
 ### LoRAs / adapters / extra conditioning (what this workflow does and doesn’t do)
@@ -297,6 +507,14 @@ The workflow itself doesn’t encode training dataset metadata, so anything beyo
 - **Known from the workflow**
   - Trained/packaged to use **UMT5 XXL** embeddings and a **WAN-specific VAE**.
   - A **TI2V** backbone suggests training included image-conditioned video generation (e.g., conditioning on a reference/start frame).
+
+- **Reported training data improvements (Wan2.2 README summary)**
+  - **+83.2% more training videos** (motion diversity)
+  - **+65.6% more training images** (semantic coverage)
+  - **Aesthetic curation** (labels for lighting, composition, contrast, color tone control)
+  - **Cinematic-quality data** emphasis
+
+  (Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
 
 - **Reasonable inferences**
   - The model likely learned camera/motion language from captioned video data.
@@ -381,6 +599,7 @@ This is the “minimum viable WAN 2.2 TI2V graph”:
 
 ### Source references
 
+- Architecture reference: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2)
 - Workflow template: [video_wan2_2_5B_ti2v.json](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)
 - Tutorial: [ComfyUI WAN 2.2 tutorial](https://docs.comfy.org/tutorials/video/wan/wan2_2)
 - Model files (as referenced by the workflow):
