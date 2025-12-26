@@ -4,26 +4,406 @@
 > 
 > **GitHub Repository**: [Wan-Video/Wan2.2](https://github.com/Wan-Video/Wan2.2)
 > 
-> **Last Updated**: December 2024
+> **Last Updated**: December 2025
 
 ---
 
 ## Table of Contents
 
-1. [High-Level Overview](#high-level-overview)
-2. [System Architecture Diagram](#system-architecture-diagram)
-3. [Model Variants](#model-variants)
-4. [Core Components Deep Dive](#core-components-deep-dive)
-5. [Mixture-of-Experts (MoE) Architecture](#mixture-of-experts-moe-architecture)
-6. [VAE Architecture](#vae-architecture)
-7. [Text Encoder (UMT5-XXL)](#text-encoder-umt5-xxl)
-8. [End-to-End Execution Flow](#end-to-end-execution-flow)
-9. [Node-by-Node Data Flow](#node-by-node-data-flow)
-10. [Variable and Parameter Reference](#variable-and-parameter-reference)
-11. [Memory Optimization Strategies](#memory-optimization-strategies)
-12. [Key Insights and Modification Guidelines](#key-insights-and-modification-guidelines)
+### Part 1 — WAN 2.2 in our architecture (business → system → nodes)
+
+1. [Executive Summary (Business + Architecture)](#executive-summary-business--architecture)
+2. [Architecture Extension Overview](#architecture-extension-overview)
+3. [ASCII Diagrams (multi-level)](#ascii-diagrams-multi-level)
+4. [End-to-End Request Walkthrough (Concept → Execution)](#end-to-end-request-walkthrough-concept--execution)
+5. [Node & Dependency Breakdown (Technical Detail)](#node--dependency-breakdown-technical-detail)
+6. [Variable → Outcome Mapping (Engineer Control Surface)](#variable--outcome-mapping-engineer-control-surface)
+7. [Practical tuning and operating guidance](#practical-tuning-and-operating-guidance)
+
+### Part 2 — Appendix: WAN 2.2 deep technical reference (DeepWiki-derived)
+
+8. [High-Level Overview](#high-level-overview)
+9. [System Architecture Diagram](#system-architecture-diagram)
+10. [Model Variants](#model-variants)
+11. [Core Components Deep Dive](#core-components-deep-dive)
+12. [Mixture-of-Experts (MoE) Architecture](#mixture-of-experts-moe-architecture)
+13. [VAE Architecture](#vae-architecture)
+14. [Text Encoder (UMT5-XXL)](#text-encoder-umt5-xxl)
+15. [End-to-End Execution Flow](#end-to-end-execution-flow)
+16. [Node-by-Node Data Flow](#node-by-node-data-flow)
+17. [Variable and Parameter Reference](#variable-and-parameter-reference)
+18. [Memory Optimization Strategies](#memory-optimization-strategies)
+19. [Key Insights and Modification Guidelines](#key-insights-and-modification-guidelines)
 
 ---
+
+## Executive Summary (Business + Architecture)
+
+This document extends **our ComfyUI-based video generation architecture** by adding a clearly owned, engineer-tunable integration point for **WAN 2.2 TI2V-5B**. It is intentionally written from the perspective of *our system*: business intent → workflow selection → ComfyUI execution → outputs + feedback.
+
+**Primary references**:
+
+- WAN architecture + variants (MoE vs dense TI2V-5B): [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2)
+- ComfyUI WAN 2.2 TI2V workflow template (the graph we run): [video_wan2_2_5B_ti2v.json](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)
+- ComfyUI WAN 2.2 tutorial: [docs.comfy.org/tutorials/video/wan/wan2_2](https://docs.comfy.org/tutorials/video/wan/wan2_2)
+
+### 1) Business rationale (why this exists in our stack)
+
+WAN 2.2 helps us ship a **high-quality, controllable 5s @ 720p (24fps)** video capability with a control surface that maps cleanly to business goals:
+
+- **Quality**: better temporal coherence/camera motion with a modern diffusion-video backbone.
+- **Speed**: the TI2V-5B variant is designed to be feasible on **24GB-class GPUs** using a high-compression VAE (enabling faster iteration for most workloads).
+- **Cost**: TI2V-5B on consumer GPUs lowers infra cost vs. forcing every run onto multi-GPU enterprise setups.
+- **Flexibility**: our “workflow catalog” approach lets us route requests (T2V vs TI2V vs I2V) and add adapters/LoRAs later without rewriting the entire system.
+
+Why adopt/extend WAN 2.2 vs alternatives (in our system terms):
+
+- **Operational simplicity**: a single ComfyUI graph with a small number of stability-critical knobs is easier to productionize than highly modular graphs with many moving parts.
+- **Scaling path**: WAN 2.2 explicitly offers both **consumer-friendly dense (TI2V-5B)** and **enterprise MoE (A14B)** variants (see [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2)).
+
+### 2) What success looks like (measurable)
+
+We evaluate WAN 2.2 integration in our system on *measurable* outcomes:
+
+- **Quality**
+  - % of outputs passing QA checks (no severe flicker, no gross deformation, no subtitles/watermarks if disallowed)
+  - human preference / rating lift vs baseline model/workflow
+- **Latency**
+  - p50/p95 wall-clock for our “default” preset (e.g., 121 frames @ 24fps, 1280×704)
+- **Cost**
+  - GPU-minutes per successful render
+  - failure/OOM rate (wasted GPU time)
+- **Iteration speed**
+  - time from prompt/config tweak → new result
+  - reproducibility rate (same inputs + seed → same output)
+
+---
+
+## Architecture Extension Overview
+
+This section makes the integration boundaries explicit so engineers know **what is durable**, **what is workflow**, and **what is tunable**.
+
+### What remains unchanged (durable systems)
+
+These are system capabilities we keep stable while swapping/adding workflows:
+
+- **Workflow catalog & versioning**: we treat ComfyUI workflow JSON + docs in `video-gen/comyfui/` as versioned assets.
+- **Model artifact management**: downloading, storing, and pinning model files.
+- **Execution runtime**: a ComfyUI runtime (local or service) that executes graph JSON.
+- **Artifact storage**: storing video outputs + metadata (prompt, seed, node params) for reproducibility.
+- **Telemetry**: latency/VRAM/failure metrics.
+
+### What is added/augmented by WAN 2.2
+
+- **New workflow(s)**: WAN 2.2 TI2V graph (`video_wan2_2_5B_ti2v.json`) and any internal variants we fork.
+- **New model set** (WAN diffusion + WAN VAE + UMT5 encoder), as referenced by the workflow template:
+  - diffusion model: `wan2.2_ti2v_5B_fp16.safetensors`
+  - VAE: `wan2.2_vae.safetensors`
+  - text encoder: `umt5_xxl_fp8_e4m3fn_scaled.safetensors`
+
+### Clear boundaries (ownership + change policy)
+
+- **Durable systems (platform-owned)**
+  - job orchestration, GPU allocation, artifact storage, logging/metrics
+- **Runtime workflows (workflow-owned)**
+  - ComfyUI graph structure (node wiring), model compatibility matrix, default presets
+- **Experimental/tunable components (product/research-owned)**
+  - prompt templates, negative prompt libraries, “safe iteration” sampler settings, A/B test presets
+
+---
+
+## ASCII Diagrams (multi-level)
+
+### A) Business goals → architectural components
+
+```
+BUSINESS GOALS
+  ├─ Quality ─────────────────────┬─ Prompt templates + negative library
+  │                               ├─ Workflow defaults (CFG/steps/denoise)
+  │                               └─ Model variant choice (TI2V-5B vs A14B)
+  ├─ Latency (p95) ───────────────┬─ Resolution/frames policy (token budget)
+  │                               ├─ Steps / sampler preset
+  │                               └─ Model preload + caching
+  ├─ Cost per render ─────────────┬─ TI2V-5B on 24GB GPUs (where possible)
+  │                               ├─ Failure/OOM guardrails
+  │                               └─ Batch/queue strategy
+  └─ Flexibility / iteration ─────┬─ Workflow catalog (route by intent)
+                                  ├─ Parameterization (safe knobs)
+                                  └─ Adapter injection points (future)
+```
+
+### B) Architectural components → workflow nodes
+
+```
+[Model Store]
+  ├─► (37) UNETLoader
+  ├─► (38) CLIPLoader
+  └─► (39) VAELoader
+
+[Prompt Builder]
+  ├─► (6) CLIPTextEncode (positive)
+  └─► (7) CLIPTextEncode (negative)
+
+[Input Prep]
+  └─► (56) LoadImage ─► (55) Wan22ImageToVideoLatent
+
+[Sampling Engine]
+  (48) ModelSamplingSD3 ─► (3) KSampler
+
+[Decode + Packaging]
+  (8) VAEDecode ─► (57) CreateVideo ─► (58) SaveVideo
+
+[Metadata/Telemetry]
+  Capture: prompts, seed/mode, steps/cfg, width/height/frames/fps, model filenames, workflow revision
+```
+
+### C) Workflow nodes → tunable variables (engineer control surface)
+
+```
+(6)/(7) CLIPTextEncode
+  - positive_prompt / negative_prompt  → semantics, style, artifact avoidance
+
+(55) Wan22ImageToVideoLatent
+  - width/height/frames               → VRAM, cost, output length, drift risk
+
+(3) KSampler
+  - steps                             → quality vs latency
+  - cfg                               → prompt adherence vs motion naturalness
+  - denoise                           → start-image adherence vs creativity
+  - sampler/scheduler                 → stability/character of motion
+  - seed + seed_mode                  → reproducibility
+
+(57) CreateVideo
+  - fps                               → playback speed (not generation compute)
+
+(37)/(38)/(39) loaders + (48) ModelSamplingSD3
+  - model files + sampling shift      → stability-critical compatibility
+```
+
+---
+
+## End-to-End Request Walkthrough (Concept → Execution)
+
+Trace a single request through our architecture (what happens and why):
+
+### Example request (business intent)
+
+> “Generate a 5-second, 720p, cinematic product shot video. Use this reference image as the first frame. The camera should dolly right slowly.”
+
+### Step 1 — Business intent → workflow selection
+
+- If **start image is provided** and the intent is “anchor identity/composition,” we select **WAN TI2V**.
+- If no image is provided, we route to **WAN T2V** (different workflow/preset).
+
+**Why this step exists**: picking the right workflow is the highest-leverage lever for cost and quality. TI2V gives stronger first-frame control; T2V is simpler/faster when you don’t need anchoring.
+
+### Step 2 — Input preparation (text, image, conditioning)
+
+- **Prompt construction**
+  - Build a structured positive prompt (subject → action → camera → lighting → style).
+  - Select a negative prompt “baseline” to reduce common artifacts.
+- **Image preparation**
+  - Load/crop/resize reference image to the target aspect ratio.
+  - Ensure width/height conform to workflow constraints (multiples of 64 in this template).
+
+**Why this step exists**: most “model failures” are actually input mismatches (aspect ratio distortion, contradictory prompt vs image, or overly aggressive negatives).
+
+### Step 3 — WAN 2.2 execution (ComfyUI graph)
+
+- Load models (cached if already resident).
+- Encode prompts → conditioning.
+- Encode start image → latent initialization.
+- Run diffusion sampling loop.
+- Decode frames → create video.
+
+**Why this step exists**: this is where we spend GPU time. Everything upstream exists to make this step deterministic, debuggable, and cost-controlled.
+
+### Step 4 — Output handling + feedback loops
+
+- Save video + persist a **reproducibility bundle**:
+  - workflow JSON hash/version
+  - all node widget values
+  - prompts, seed/mode
+  - model filenames
+- Capture metrics (latency, VRAM, failure reason if any).
+- Feed outcomes into:
+  - prompt template improvements
+  - preset tuning (steps/cfg/denoise)
+  - routing policy (when TI2V is worth the cost)
+
+---
+
+## Node & Dependency Breakdown (Technical Detail)
+
+This section is the engineer-facing “node contract.” The canonical TI2V workflow we run is the Comfy-Org template: [video_wan2_2_5B_ti2v.json](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_wan2_2_5B_ti2v.json)
+
+### (37) UNETLoader
+
+- **Upstream deps**: model files on disk
+- **Inputs → processing → outputs**: `MODEL` weights loaded → `MODEL`
+- **Downstream**: `(48) ModelSamplingSD3`
+- **Business meaning**: selecting the backbone (quality/cost envelope)
+- **Stability**: **critical** (must match the WAN workflow family)
+
+### (38) CLIPLoader (WAN UMT5/T5 encoder)
+
+- **Outputs**: `CLIP` encoder handle
+- **Downstream**: `(6)/(7) CLIPTextEncode`
+- **Business meaning**: prompt understanding quality + multilingual prompt support
+- **Stability**: **critical** (encoder must match training)
+
+### (6) CLIPTextEncode (positive)
+
+- **Input**: `text` → **embeddings/conditioning**
+- **Output**: `CONDITIONING`
+- **Downstream**: `(3) KSampler.positive`
+- **Business meaning**: primary semantic/style control
+- **Safe knobs**: prompt text, template structure
+
+### (7) CLIPTextEncode (negative)
+
+- **Output**: `CONDITIONING`
+- **Downstream**: `(3) KSampler.negative`
+- **Business meaning**: artifact suppression + policy constraints (e.g., “no subtitles/watermarks”)
+- **Safe knobs**: negative prompt library; beware over-constraining (can reduce motion/detail)
+
+### (39) VAELoader (WAN VAE)
+
+- **Outputs**: `VAE`
+- **Downstream**: `(55) Wan22ImageToVideoLatent`, `(8) VAEDecode`
+- **Business meaning**: decode fidelity + compatibility; impacts speed/memory through compression behavior
+- **Stability**: **critical** (VAE must match the WAN checkpoint)
+
+### (56) LoadImage
+
+- **Outputs**: `IMAGE` (and `MASK`, unused)
+- **Downstream**: `(55) Wan22ImageToVideoLatent.start_image`
+- **Business meaning**: first-frame anchoring; reduces iteration cost when clients provide a reference frame
+
+### (55) Wan22ImageToVideoLatent
+
+- **Inputs**: `VAE` + `IMAGE`
+- **Output**: initial video `LATENT`
+- **Downstream**: `(3) KSampler.latent_image`
+- **Data shape change (conceptual)**:
+  - `IMAGE` → VAE latent (compressed) → spatio-temporal latent sized by `width/height/frames`
+- **Business meaning**: this is the **token budget** knob that dominates VRAM/cost
+- **Safe knobs**: width/height/frames within known-good presets
+- **Stability-critical constraints**:
+  - width/height should remain multiples of 64
+  - frames often work best as **8n+1** (the template uses 121)
+
+### (48) ModelSamplingSD3
+
+- **Role**: applies model-specific sampling conventions (sigma/noise schedule compatibility)
+- **Stability**: **critical** (treat as “do not touch” unless you are matching training/sampler math)
+
+### (3) KSampler
+
+- **Inputs**: `MODEL`, `CONDITIONING` (pos/neg), initial `LATENT`
+- **Output**: denoised `LATENT`
+- **Business meaning**: primary quality/latency trade-off node
+- **Safe knobs**:
+  - steps (15–30 typical)
+  - cfg (3–7 typical)
+  - denoise (0.6–1.0 depending on start-image adherence)
+  - seed mode (fixed for reproducibility)
+- **Stability caution**: sampler/scheduler changes can alter motion/quality drastically
+
+### (8) VAEDecode
+
+- **Inputs**: denoised `LATENT` + `VAE`
+- **Output**: `IMAGE` frames
+- **Business meaning**: visual fidelity; failures here usually indicate incompatibility/memory pressure
+
+### (57) CreateVideo
+
+- **Inputs**: `IMAGE` frames (+ optional `AUDIO`, unused)
+- **Output**: `VIDEO`
+- **Knob**: fps (affects playback speed)
+
+### (58) SaveVideo
+
+- **Input**: `VIDEO`
+- **Output**: file written
+- **Business meaning**: artifact handling + reproducibility (store path + metadata)
+
+---
+
+## Variable → Outcome Mapping (Engineer Control Surface)
+
+This table enumerates the key tunables *engineers actually touch* in this workflow and maps them to business outcomes.
+
+| Variable (node) | Affects | When to change | Safe range / default | What breaks if wrong |
+| --- | --- | --- | --- | --- |
+| Positive prompt `(6)` | semantic quality, style, motion intent | first lever for iteration | structured prompt | vague prompt → weak adherence |
+| Negative prompt `(7)` | artifact rate, compliance | when artifacts recur | start from baseline | too strong → frozen motion/detail loss |
+| Start image path/mode `(56)` | identity + composition anchoring | when using TI2V | match aspect ratio | distortion/jitter if mismatched |
+| width/height `(55)` | VRAM, cost, detail | when you need different output size | multiples of 64 (template: 1280×704) | OOM, distortions, invalid shapes |
+| frames `(55)` | duration, drift risk, cost | when changing length | prefer 8n+1 (template: 121) | instability/drift/OOM |
+| batch `(55)` | throughput vs VRAM | batching experiments | keep 1 unless proven | OOM + queue blowups |
+| seed `(3)` | reproducibility | debugging/tuning | fixed during tuning | randomize → can’t compare runs |
+| seed mode `(3)` | determinism policy | when iterating | fixed vs randomize | poor experiment hygiene |
+| steps `(3)` | quality vs latency | when quality insufficient | 15–30 (template: 20) | too low → noisy/blur; too high → slow |
+| cfg `(3)` | adherence vs motion naturalness | prompt ignored / motion unnatural | 3–7 (template: 5) | too high → artifacts/static feel |
+| denoise `(3)` | start-image adherence | when start frame ignored | 0.6–1.0 (template: 1.0) | too low → weak motion; too high → drift |
+| sampler `(3)` | stability + motion character | only with intent | keep template (`uni_pc`) | regressions/instability |
+| scheduler `(3)` | stability/contrast | only with intent | keep template (`simple`) | regressions/instability |
+| sampling shift `(48)` | sampling correctness | **do not change casually** | keep template (`8`) | severe degradation/failure |
+| diffusion model file `(37)` | quality/capability | upgrades only | pinned versions | mismatch → failure |
+| text encoder file/profile `(38)` | prompt understanding | upgrades only | pinned + `wan` profile | mismatch → failure |
+| VAE file `(39)` | decode fidelity + compression behavior | upgrades only | pinned versions | mismatch → failure |
+| fps `(57)` | playback speed | when adjusting delivery | 12–30 (template: 24) | wrong duration feel |
+| output dir/codec `(58)` | artifact handling + ops | deployment | pinned/policy | storage/compat issues |
+
+**Safe iteration parameters**: prompts, steps, cfg, denoise, seed.
+
+**Stability-critical parameters**: model filenames, VAE/text encoder pairing, `ModelSamplingSD3` setting, width/height constraints, sampler/scheduler (unless validated).
+
+---
+
+## Practical tuning and operating guidance
+
+### A reliable iteration loop (engineer workflow)
+
+1. **Fix the seed** and keep resolution/frames at the default preset.
+2. Iterate on **prompt structure** (subject/action/camera/lighting/style).
+3. Adjust **CFG** (3→7) before increasing steps.
+4. Increase **steps** only if you need more detail/stability.
+5. Adjust **denoise** to control how strongly the start image anchors identity.
+6. Only then change **resolution/frames** (token budget).
+
+### Guardrails (keep the system stable)
+
+- Always persist the **repro bundle** (workflow version + all widget values + prompts + seed + model filenames).
+- Maintain a small set of **validated presets** (resolution × frames × sampler/scheduler).
+- Route requests to the cheapest workflow that meets the intent (e.g., TI2V only when start-image anchoring matters).
+
+
+### Engineer intervention checklist (node + variable level)
+
+- **Safe iteration (day-to-day)**
+  - Edit prompt + negative prompt in `(6)` / `(7)`.
+  - Tune sampler knobs in `(3)` (steps/cfg/denoise/seed) to hit quality/latency targets.
+  - Adjust delivery knobs in `(57)` / `(58)` (fps, output settings) to meet product requirements.
+
+- **Preset changes (performance/cost envelope)**
+  - Adjust `(55)` width/height/frames only inside a validated preset grid (token budget guardrail).
+
+- **Stability-critical changes (treat as migrations)**
+  - Model upgrades in `(37)/(38)/(39)` and sampling convention changes in `(48)` must be tested as a versioned rollout because they can silently change output distribution or fail at runtime.
+
+- **Always capture “repro metadata”**
+  - Persist the full workflow JSON (or hash), all node widget values, prompts, seed/mode, and model filenames.
+
+
+---
+
+## Appendix: WAN 2.2 Deep Technical Reference (DeepWiki-derived)
+
+The remaining sections below are a deep technical reference on WAN 2.2 itself (variants, MoE, VAE, etc.). Use this appendix when you need to reason about *why* the workflow behaves the way it does or when considering model upgrades/variant switches.
+
+**Note for our TI2V deployment:** some generic WAN diagrams annotate VAE spatial compression as `H/16, W/16`. DeepWiki describes **TI2V-5B** as using **higher spatial compression (`H/32, W/32`)** plus additional patchification to enable 720p workloads on 24GB GPUs. Use that mental model when estimating token budgets/VRAM for our presets. (Source: [DeepWiki: Wan-Video/Wan2.2](https://deepwiki.com/Wan-Video/Wan2.2))
 
 ## High-Level Overview
 
